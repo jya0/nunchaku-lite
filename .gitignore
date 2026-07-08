@@ -22,3 +22,7 @@ test_results/
 .env
 .venv/
 venv/
+
+# LoRA checkpoints and example script (not tracked)
+*.safetensors
+example.py
