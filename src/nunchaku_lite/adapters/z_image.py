@@ -35,8 +35,14 @@ def _pack_z_image_rotary_emb(freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Returns:
         Float32 packed rotary tensor accepted by the fused SVDQ GEMM kernels.
+
+    The batch and sequence dimensions are flattened together before padding so
+    that the total token count matches the activation quantizer's padding (which
+    pads ``batch * seq`` to a multiple of 256, not each batch item individually).
     """
 
+    batch, seq_len, dim_half = freqs_cis.shape
+    freqs_cis = freqs_cis.reshape(1, batch * seq_len, dim_half)
     rotemb = torch.view_as_real(freqs_cis).unsqueeze(3)
     rotemb = torch.flip(rotemb, dims=[-1])
     return pack_rotemb(pad_tensor(rotemb, 256, 1))

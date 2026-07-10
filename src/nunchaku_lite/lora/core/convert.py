@@ -123,12 +123,13 @@ def group_fused_projection_pairs(
             if spec.target in base:
                 groups[base] = (spec, [base])
                 break
-            first_branch = spec.branches[0]
-            if first_branch in base:
-                target = base.replace(first_branch, spec.target)
-                branches = [base.replace(first_branch, branch) for branch in spec.branches]
-                groups[target] = (spec, [branch for branch in branches if branch in pairs])
-                break
+            matched_branch = next((branch for branch in spec.branches if branch in base), None)
+            if matched_branch is None:
+                continue
+            target = base.replace(matched_branch, spec.target)
+            branches = [base.replace(matched_branch, branch) for branch in spec.branches]
+            groups[target] = (spec, [branch for branch in branches if branch in pairs])
+            break
     return groups
 
 

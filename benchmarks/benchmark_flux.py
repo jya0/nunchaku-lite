@@ -19,7 +19,7 @@ from utils import (
 
 
 DEFAULT_MODEL_ID = "black-forest-labs/FLUX.1-schnell"
-DEFAULT_CHECKPOINT = "nunchaku-ai/nunchaku-flux.1-schnell/svdq-fp4_r32-flux.1-schnell.safetensors"
+DEFAULT_CHECKPOINT = "nunchaku-ai/nunchaku-flux.1-schnell/svdq-int4_r32-flux.1-schnell.safetensors"
 DEFAULT_PROMPT = "A cat holding a sign that says hello world"
 
 
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
-    parser.add_argument("--precision", choices=["auto", "fp4", "int4"], default="fp4")
+    parser.add_argument("--precision", choices=["auto", "fp4", "int4"], default="int4")
     parser.add_argument("--skip-original", action="store_true")
     parser.add_argument("--skip-lite", action="store_true")
     parser.add_argument("--run-original-nunchaku", action="store_true")

@@ -202,6 +202,24 @@ def test_normalize_z_image_lora_keys_rewrites_prefixes_and_lora_names():
     }
 
 
+def test_normalize_z_image_lora_keys_accepts_bare_lora_suffix():
+    state_dict = {
+        "layers.0.attention.to_q.lora_A": torch.ones(1, 4),
+        "layers.0.attention.to_q.lora_B": torch.ones(4, 1),
+        "layers.0.attention.to_k.lora_down": torch.ones(1, 4),
+        "layers.0.attention.to_k.lora_up": torch.ones(4, 1),
+    }
+
+    normalized = normalize_z_image_diffusers_lora_state_dict(state_dict)
+
+    assert set(normalized) == {
+        "layers.0.attention.to_q.lora_A.weight",
+        "layers.0.attention.to_q.lora_B.weight",
+        "layers.0.attention.to_k.lora_A.weight",
+        "layers.0.attention.to_k.lora_B.weight",
+    }
+
+
 def test_convert_z_image_qkv_lora_to_nunchaku_fused_projection():
     transformer = make_patched_z_image_transformer(rank=4)
     module = transformer.get_submodule("layers.0.attention.to_qkv")

@@ -124,6 +124,12 @@ def normalize_z_image_diffusers_lora_state_dict(state_dict: dict[str, torch.Tens
             new_key = new_key[len("diffusion_model.") :]
         new_key = new_key.replace(".lora_down.weight", LORA_A_SUFFIX)
         new_key = new_key.replace(".lora_up.weight", LORA_B_SUFFIX)
+        if not new_key.endswith((".lora_down.weight", ".lora_up.weight", LORA_A_SUFFIX, LORA_B_SUFFIX)):
+            new_key = new_key.replace(".lora_down", LORA_A_SUFFIX)
+            new_key = new_key.replace(".lora_up", LORA_B_SUFFIX)
+            if not new_key.endswith((LORA_A_SUFFIX, LORA_B_SUFFIX)):
+                new_key = new_key.replace(".lora_A", LORA_A_SUFFIX)
+                new_key = new_key.replace(".lora_B", LORA_B_SUFFIX)
         tensors[new_key] = normalize_float_tensor(value)
     return apply_network_alphas(tensors, extract_network_alphas(tensors))
 
