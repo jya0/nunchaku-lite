@@ -277,6 +277,16 @@ class NunchakuPipelineLoraMixin:
             )
         transformer = self._pipeline_transformer()
         ensure_lora_runtime(transformer)
+        # Local files and in-memory state dicts are loaded directly through the
+        # Nunchaku Lite converter, which natively handles Kohya/ai-toolkit
+        # native Z-Image LoRA formats (including ``.diff``/``.diff_b`` deltas)
+        # that Diffusers' ``lora_state_dict`` cannot convert. Hub repo ids still
+        # fall back to the Diffusers loader so cached/remote weights resolve.
+        if _is_local_lora_source(pretrained_model_name_or_path_or_dict):
+            state_dict = load_lora_state_dict(pretrained_model_name_or_path_or_dict)
+            raise_if_text_encoder_lora(state_dict)
+            transformer.load_lora(state_dict, name=adapter_name)
+            return
         kwargs["return_lora_metadata"] = True
         result = self.lora_state_dict(
             pretrained_model_name_or_path_or_dict,
@@ -520,6 +530,31 @@ def load_lora_state_dict(path_or_state_dict: str | Path | dict[str, torch.Tensor
     if isinstance(path_or_state_dict, dict):
         return dict(path_or_state_dict)
     return load_state_dict_in_safetensors(path_or_state_dict)
+
+
+def _is_local_lora_source(pretrained_model_name_or_path_or_dict: str | dict[str, torch.Tensor]) -> bool:
+    """Return whether a LoRA source can be loaded without the Diffusers loader.
+
+    Local safetensors files and in-memory state dicts are read directly by the
+    Nunchaku Lite converter, bypassing Diffusers' ``lora_state_dict``. That
+    converter is lossy for native Kohya/ai-toolkit Z-Image LoRAs (it cannot
+    consume ``.diff``/``.diff_b`` delta keys), whereas the Lite converter
+    handles them natively.
+
+    Args:
+        pretrained_model_name_or_path_or_dict: Source passed to
+            ``load_lora_weights``.
+
+    Returns:
+        ``True`` for in-memory dicts and existing local file paths.
+    """
+
+    if isinstance(pretrained_model_name_or_path_or_dict, dict):
+        return True
+    if isinstance(pretrained_model_name_or_path_or_dict, (str, Path)):
+        path = Path(pretrained_model_name_or_path_or_dict)
+        return path.is_file()
+    return False
 
 
 def strip_component_prefixes(
