@@ -574,6 +574,154 @@ def test_z_image_native_lora_changes_attention_and_feed_forward_blocks():
             assert (enabled - disabled).float().abs().max() > 1e-5, f"{label} did not respond to LoRA."
 
 
+def test_z_image_direct_target_name_rewrites_kohya_fused_keys():
+    from nunchaku_lite.lora.z_image import z_image_direct_target_name
+
+    assert z_image_direct_target_name("layers.0.attention.qkv") == "layers.0.attention.to_qkv"
+    assert z_image_direct_target_name("layers.0.attention.out") == "layers.0.attention.to_out.0"
+    assert z_image_direct_target_name("context_refiner.0.attention.qkv") == "context_refiner.0.attention.to_qkv"
+    assert z_image_direct_target_name("noise_refiner.1.attention.out") == "noise_refiner.1.attention.to_out.0"
+    # Diffusers names are left unchanged (except the existing feed_forward.w2 rewrite).
+    assert z_image_direct_target_name("layers.0.attention.to_out.0") == "layers.0.attention.to_out.0"
+    assert z_image_direct_target_name("layers.0.adaLN_modulation.0") == "layers.0.adaLN_modulation.0"
+    assert z_image_direct_target_name("layers.0.feed_forward.w2") == "layers.0.feed_forward.net.2"
+
+
+def test_convert_z_image_kohya_fused_qkv_and_out_lora_matches_diffusers():
+    transformer = make_patched_z_image_transformer(rank=4)
+    qkv_module = transformer.get_submodule("layers.0.attention.to_qkv")
+    out_module = transformer.get_submodule("layers.0.attention.to_out.0")
+    rank = 2
+    # Kohya/ai-toolkit native format: a single already-fused ``attention.qkv``
+    # pair and ``attention.out`` pair (diffusion_model prefix, lora_down/up).
+    q_down = torch.ones(rank, qkv_module.in_features, dtype=torch.bfloat16)
+    q_up = torch.full((qkv_module.out_features // 3, rank), 1.0, dtype=torch.bfloat16)
+    k_up = torch.full((qkv_module.out_features // 3, rank), 2.0, dtype=torch.bfloat16)
+    v_up = torch.full((qkv_module.out_features // 3, rank), 3.0, dtype=torch.bfloat16)
+    kohya_qkv_up = torch.cat([q_up, k_up, v_up], dim=0)
+    kohya = {
+        "diffusion_model.layers.0.attention.qkv.lora_down.weight": q_down,
+        "diffusion_model.layers.0.attention.qkv.lora_up.weight": kohya_qkv_up,
+        "diffusion_model.layers.0.attention.out.lora_down.weight": torch.ones(
+            rank, out_module.in_features, dtype=torch.bfloat16
+        ),
+        "diffusion_model.layers.0.attention.out.lora_up.weight": torch.full(
+            (out_module.out_features, rank), 5.0, dtype=torch.bfloat16
+        ),
+    }
+
+    converted = transformer._convert_lora_to_nunchaku(kohya)
+
+    assert set(converted) == {
+        "layers.0.attention.to_qkv.proj_down",
+        "layers.0.attention.to_qkv.proj_up",
+        "layers.0.attention.to_out.0.proj_down",
+        "layers.0.attention.to_out.0.proj_up",
+    }
+    # The fused qkv up tensor should preserve the concatenated q/k/v branch order.
+    logical_up = unpack_lowrank_weight(converted["layers.0.attention.to_qkv.proj_up"], down=False)
+    third = qkv_module.out_features // 3
+    assert torch.allclose(logical_up[:third, :rank], q_up)
+    assert torch.allclose(logical_up[third : 2 * third, :rank], k_up)
+    assert torch.allclose(logical_up[2 * third : qkv_module.out_features, :rank], v_up)
+    logical_out_up = unpack_lowrank_weight(converted["layers.0.attention.to_out.0.proj_up"], down=False)
+    assert torch.allclose(
+        logical_out_up[: out_module.out_features, :rank], torch.full((out_module.out_features, rank), 5.0, dtype=torch.bfloat16)
+    )
+
+
+def test_convert_z_image_kohya_lora_deltas_match_diffusers_equivalent():
+    base = make_tiny_z_image_transformer()
+    rank = 2
+    # Build a Diffusers-format LoRA with separate to_q/to_k/to_v branches that
+    # share the same lora_A (down) tensor, so the Kohya fused-qkv equivalent
+    # (which uses one shared down matrix) is mathematically identical.
+    shared_qkv_down = (torch.randn(rank, base.layers[0].attention.to_q.in_features) * 0.01).to(torch.bfloat16)
+    diffusers_lora = {}
+    branch_modules = {
+        "layers.0.attention.to_q": base.layers[0].attention.to_q,
+        "layers.0.attention.to_k": base.layers[0].attention.to_k,
+        "layers.0.attention.to_v": base.layers[0].attention.to_v,
+    }
+    for index, (name, module) in enumerate(branch_modules.items(), start=1):
+        torch.manual_seed(index)
+        diffusers_lora[f"transformer.{name}.lora_A.weight"] = shared_qkv_down.clone()
+        diffusers_lora[f"transformer.{name}.lora_B.weight"] = (
+            torch.randn(module.out_features, rank) * 0.01
+        ).to(torch.bfloat16)
+    other_modules = {
+        "layers.0.attention.to_out.0": base.layers[0].attention.to_out[0],
+        "layers.0.feed_forward.w1": base.layers[0].feed_forward.w1,
+        "layers.0.feed_forward.w3": base.layers[0].feed_forward.w3,
+        "layers.0.feed_forward.w2": base.layers[0].feed_forward.w2,
+        "layers.0.adaLN_modulation.0": base.layers[0].adaLN_modulation[0],
+    }
+    for index, (name, module) in enumerate(other_modules.items(), start=10):
+        torch.manual_seed(index)
+        diffusers_lora[f"transformer.{name}.lora_A.weight"] = (
+            torch.randn(rank, module.in_features) * 0.01
+        ).to(torch.bfloat16)
+        torch.manual_seed(index + 100)
+        diffusers_lora[f"transformer.{name}.lora_B.weight"] = (
+            torch.randn(module.out_features, rank) * 0.01
+        ).to(torch.bfloat16)
+
+    # Build the Kohya-native equivalent: fused qkv (shared down), attention.out naming.
+    kohya = {
+        "diffusion_model.layers.0.attention.qkv.lora_down.weight": shared_qkv_down.clone(),
+        "diffusion_model.layers.0.attention.qkv.lora_up.weight": torch.cat(
+            [
+                diffusers_lora["transformer.layers.0.attention.to_q.lora_B.weight"],
+                diffusers_lora["transformer.layers.0.attention.to_k.lora_B.weight"],
+                diffusers_lora["transformer.layers.0.attention.to_v.lora_B.weight"],
+            ],
+            dim=0,
+        ),
+        "diffusion_model.layers.0.attention.out.lora_down.weight": diffusers_lora[
+            "transformer.layers.0.attention.to_out.0.lora_A.weight"
+        ].clone(),
+        "diffusion_model.layers.0.attention.out.lora_up.weight": diffusers_lora[
+            "transformer.layers.0.attention.to_out.0.lora_B.weight"
+        ].clone(),
+        "diffusion_model.layers.0.feed_forward.w1.lora_down.weight": diffusers_lora[
+            "transformer.layers.0.feed_forward.w1.lora_A.weight"
+        ].clone(),
+        "diffusion_model.layers.0.feed_forward.w1.lora_up.weight": diffusers_lora[
+            "transformer.layers.0.feed_forward.w1.lora_B.weight"
+        ].clone(),
+        "diffusion_model.layers.0.feed_forward.w3.lora_down.weight": diffusers_lora[
+            "transformer.layers.0.feed_forward.w3.lora_A.weight"
+        ].clone(),
+        "diffusion_model.layers.0.feed_forward.w3.lora_up.weight": diffusers_lora[
+            "transformer.layers.0.feed_forward.w3.lora_B.weight"
+        ].clone(),
+        "diffusion_model.layers.0.feed_forward.w2.lora_down.weight": diffusers_lora[
+            "transformer.layers.0.feed_forward.w2.lora_A.weight"
+        ].clone(),
+        "diffusion_model.layers.0.feed_forward.w2.lora_up.weight": diffusers_lora[
+            "transformer.layers.0.feed_forward.w2.lora_B.weight"
+        ].clone(),
+        "diffusion_model.layers.0.adaLN_modulation.0.lora_down.weight": diffusers_lora[
+            "transformer.layers.0.adaLN_modulation.0.lora_A.weight"
+        ].clone(),
+        "diffusion_model.layers.0.adaLN_modulation.0.lora_up.weight": diffusers_lora[
+            "transformer.layers.0.adaLN_modulation.0.lora_B.weight"
+        ].clone(),
+    }
+
+    diffusers_transformer = deepcopy(base)
+    ZImageLoraLoaderMixin.load_lora_into_transformer(diffusers_lora, diffusers_transformer, adapter_name="oracle")
+    transformer = make_patched_z_image_transformer(rank=4)
+    converted = transformer._convert_lora_to_nunchaku(kohya)
+
+    runtime_targets = sorted(key[: -len(".proj_down")] for key in converted if key.endswith(".proj_down"))
+    for runtime_name in runtime_targets:
+        actual = converted_z_image_runtime_delta(transformer, converted, runtime_name)
+        expected = expected_z_image_runtime_delta(diffusers_transformer, runtime_name)
+        assert actual.shape == expected.shape, runtime_name
+        assert torch.equal(actual, expected), runtime_name
+
+
 def test_z_image_unsupported_lora_target_raises():
     transformer = make_patched_z_image_transformer()
     lora = {

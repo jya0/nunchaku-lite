@@ -142,7 +142,14 @@ def z_image_direct_target_name(base_name: str) -> str:
     """
 
     if ".feed_forward.w2" in base_name:
-        return base_name.replace(".feed_forward.w2", ".feed_forward.net.2")
+        base_name = base_name.replace(".feed_forward.w2", ".feed_forward.net.2")
+    # Kohya/ai-toolkit native Z-Image LoRAs use already-fused ``attention.qkv``
+    # and ``attention.out`` names; rewrite them to the patched Diffusers module
+    # names so they map directly onto the fused SVDQ projections.
+    if ".attention.qkv" in base_name:
+        base_name = base_name.replace(".attention.qkv", ".attention.to_qkv")
+    if ".attention.out" in base_name:
+        base_name = base_name.replace(".attention.out", ".attention.to_out.0")
     return base_name
 
 
