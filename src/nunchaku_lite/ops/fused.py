@@ -51,6 +51,7 @@ def fused_gelu_mlp(x: torch.Tensor, fc1: SVDQW4A4Linear, fc2: SVDQW4A4Linear, pa
         fp4=fc1.precision == "nvfp4",
         alpha=fc1.wtscale,
         wcscales=fc1.wcscales,
+        lora_scales=getattr(fc1, "_nunchaku_lite_lora_scales", None),
     )
     output = torch.empty(batch_size * seq_len, fc2.out_features, dtype=x.dtype, device=x.device)
     output = fc2.forward_quant(qout_act, qout_ascales, qout_lora_act, output=output)
@@ -115,6 +116,7 @@ def fused_qkv_norm_rotary(
             out_k=out_k,
             out_v=out_v,
             attn_tokens=attn_tokens,
+            lora_scales=getattr(proj, "_nunchaku_lite_lora_scales", None),
         )
         return out_q, out_k, out_v
 
@@ -133,6 +135,7 @@ def fused_qkv_norm_rotary(
         norm_q=norm_q_weight,
         norm_k=norm_k_weight,
         rotary_emb=rotary_emb,
+        lora_scales=getattr(proj, "_nunchaku_lite_lora_scales", None),
     )
     return output.view(batch_size, seq_len, -1)
 

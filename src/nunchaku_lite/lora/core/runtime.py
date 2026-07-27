@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from pathlib import Path
 from types import MethodType
@@ -113,6 +114,7 @@ class NunchakuLoraMixin:
         strength: float = 1.0,
         name: str | None = None,
         replace: bool = False,
+        defer_recompose: bool = False,
     ) -> str:
         """Load a runtime LoRA adapter into this patched transformer.
 
@@ -121,9 +123,12 @@ class NunchakuLoraMixin:
             strength: Initial adapter scale.
             name: Optional adapter name.
             replace: Whether to clear existing adapters before loading.
+            defer_recompose: When True, skip immediate recompose for batch loading.
         """
 
-        return load_lora(self, path_or_state_dict, strength=strength, name=name, replace=replace)
+        return load_lora(
+            self, path_or_state_dict, strength=strength, name=name, replace=replace, defer_recompose=defer_recompose
+        )
 
     def load_lora_adapter(
         self,
@@ -269,6 +274,8 @@ class NunchakuPipelineLoraMixin:
             adapter_name: Optional runtime adapter name.
             hotswap: Unsupported PEFT hotswap flag.
             **kwargs: Extra loader options forwarded to ``lora_state_dict``.
+                Pass ``defer_recompose=True`` to skip immediate recompose for
+                batch loading.
         """
 
         if hotswap:
@@ -285,7 +292,9 @@ class NunchakuPipelineLoraMixin:
         if _is_local_lora_source(pretrained_model_name_or_path_or_dict):
             state_dict = load_lora_state_dict(pretrained_model_name_or_path_or_dict)
             raise_if_text_encoder_lora(state_dict)
-            transformer.load_lora(state_dict, name=adapter_name)
+            transformer.load_lora(
+                state_dict, name=adapter_name, defer_recompose=kwargs.pop("defer_recompose", False)
+            )
             return
         kwargs["return_lora_metadata"] = True
         result = self.lora_state_dict(
@@ -319,7 +328,9 @@ class NunchakuPipelineLoraMixin:
         if network_alphas:
             transformer_state = dict(transformer_state)
             transformer_state.update(network_alphas)
-        transformer.load_lora(transformer_state, name=adapter_name)
+        transformer.load_lora(
+            transformer_state, name=adapter_name, defer_recompose=kwargs.pop("defer_recompose", False)
+        )
 
     def load_lora_adapter(
         self,
@@ -444,6 +455,7 @@ def load_lora(
     strength: float = 1.0,
     name: str | None = None,
     replace: bool = False,
+    defer_recompose: bool = False,
 ) -> str:
     """Load a LoRA into a patched transformer and return its adapter name.
 
@@ -454,6 +466,10 @@ def load_lora(
         name: Optional adapter name. If omitted, a path stem or generated name
             is used.
         replace: Whether to remove existing adapters before loading this one.
+        defer_recompose: When True, skip the immediate ``recompose_loras``
+            call.  Useful for batch-loading multiple adapters: set True on all
+            but the last load, then call ``recompose_loras(transformer)`` once.
+            This reduces O(M·N²) recompose calls to O(N²) for M adapters (fix #2).
     """
 
     ensure_lora_base_state(transformer)
@@ -469,12 +485,23 @@ def load_lora(
         active_name for active_name in transformer._nunchaku_lite_active_loras if active_name != lora_name
     ]
     transformer._nunchaku_lite_active_loras.append(lora_name)
-    recompose_loras(transformer)
+    # Invalidate adapter cache — the set of loaded adapters changed (fix #5).
+    _invalidate_adapter_cache(transformer)
+    if not defer_recompose:
+        recompose_loras(transformer)
     return lora_name
 
 
 def set_lora_strength(transformer: nn.Module, strength: float = 1.0, name: str | None = None) -> None:
     """Set one adapter strength and recompose all active LoRAs.
+
+    When all active modules are SVDQ (the common case for quantized models),
+    this uses an O(1) fast path: instead of rebuilding the packed LoRA tensors,
+    it only updates the per-16-rank-block ``_nunchaku_lite_lora_scales`` lists
+    on each module.  The native kernel applies the new strength at GEMM time.
+
+    For AWQ/dense modules (or when no SVDQ modules exist), it falls back to
+    a full ``recompose_loras`` because those paths bake strength into the weight.
 
     Args:
         transformer: Patched transformer containing runtime adapter state.
@@ -494,6 +521,38 @@ def set_lora_strength(transformer: nn.Module, strength: float = 1.0, name: str |
         transformer._nunchaku_lite_loras[name]["strength"] = float(strength)
     except KeyError as exc:
         raise ValueError(f"No loaded LoRA named {name!r}.") from exc
+
+    # Fast path (fix #1): if all modules are SVDQ, just update lora_scales.
+    modules = transformer._nunchaku_lite_lora_module_cache
+    if modules is not None:
+        active_entries = active_lora_entries(transformer)
+        active_names_ordered = active_lora_names(transformer)
+        # Attach names for _build_lora_scales.
+        for i, entry in enumerate(active_entries):
+            active_entries[i] = {**entry, "name": active_names_ordered[i]}
+
+        has_non_svdq = any(not isinstance(m, SVDQW4A4Linear) for m in modules.values())
+        if not has_non_svdq:
+            # O(1) fast path: update lora_scales on every SVDQ module.
+            for module_name, module in modules.items():
+                if not isinstance(module, SVDQW4A4Linear):
+                    continue
+                base_logical = transformer._nunchaku_lite_lora_base_logical
+                base_rank = base_logical[f"{module_name}.down"].shape[0]
+                base_blocks = math.ceil(base_rank / 16)
+                # Build adapter ranks for this module from the cached adapter cache.
+                adapter_cache = _ensure_adapter_cache(transformer)
+                adapter_ranks: dict[str, int] = {}
+                for entry in active_entries:
+                    adapter_name = entry["name"]
+                    adapter_tensors = adapter_cache.get(adapter_name, {})
+                    if module_name in adapter_tensors:
+                        adapter_ranks[adapter_name] = adapter_tensors[module_name]["down"].shape[0]
+                adapter_scales = _build_lora_scales(active_entries, adapter_ranks)
+                module._nunchaku_lite_lora_scales = [1.0] * base_blocks + adapter_scales
+            return
+
+    # Fallback: full recompose (AWQ/dense modules present).
     recompose_loras(transformer)
 
 
@@ -517,6 +576,8 @@ def reset_lora(transformer: nn.Module, name: str | None = None) -> None:
         transformer._nunchaku_lite_active_loras = [
             active_name for active_name in transformer._nunchaku_lite_active_loras if active_name != name
         ]
+    # Invalidate adapter cache — the set of loaded adapters changed (fix #5).
+    _invalidate_adapter_cache(transformer)
     recompose_loras(transformer)
 
 
@@ -651,6 +712,8 @@ def set_active_adapters(transformer: nn.Module, adapter_names: list[str] | str, 
         if isinstance(weight, dict):
             weight = weight.get("transformer", 1.0)
         transformer._nunchaku_lite_loras[adapter_name]["strength"] = 1.0 if weight is None else float(weight)
+    # Invalidate adapter cache — the active set (and thus cached tensors) changed.
+    _invalidate_adapter_cache(transformer)
     recompose_loras(transformer)
 
 
@@ -692,10 +755,30 @@ def ensure_lora_runtime(transformer: nn.Module) -> None:
         transformer._nunchaku_lite_active_loras = list(transformer._nunchaku_lite_loras)
     if not hasattr(transformer, "_nunchaku_lite_lora_enabled"):
         transformer._nunchaku_lite_lora_enabled = True
+    # --- Performance caches (fix #3, #4, #5) ---
+    # Cached lora_modules() scan result — avoids 3× named_modules() per recompose.
+    if not hasattr(transformer, "_nunchaku_lite_lora_module_cache"):
+        transformer._nunchaku_lite_lora_module_cache = None
+    # Cached base state in *logical* (unpacked) form for SVDQ modules — avoids
+    # re-unpacking every recompose.
+    if not hasattr(transformer, "_nunchaku_lite_lora_base_logical"):
+        transformer._nunchaku_lite_lora_base_logical = None
+    # Cached per-adapter logical tensors, GPU-resident — avoids re-unpacking
+    # from CPU state_dict every recompose.
+    if not hasattr(transformer, "_nunchaku_lite_lora_adapter_cache"):
+        transformer._nunchaku_lite_lora_adapter_cache = None
+    # Whether the next recompose should actually rebuild tensors. When False
+    # (deferred batch loading), recompose is skipped until the caller re-enables.
+    if not hasattr(transformer, "_nunchaku_lite_defer_recompose"):
+        transformer._nunchaku_lite_defer_recompose = False
 
 
 def ensure_lora_base_state(transformer: nn.Module) -> None:
     """Snapshot base low-rank tensors before runtime LoRA composition.
+
+    Also caches the module scan and unpacked logical forms for SVDQ modules
+    so that subsequent ``recompose_loras`` calls avoid repeated tree scans
+    and unpack operations.
 
     Args:
         transformer: Patched transformer whose SVDQ/AWQ modules should be
@@ -706,11 +789,22 @@ def ensure_lora_base_state(transformer: nn.Module) -> None:
     if transformer._nunchaku_lite_lora_base_state is not None:
         return
 
+    # Cache the module scan (fix #3): lora_modules() does 3× named_modules()
+    # calls. We cache it here so recompose never re-scans.
+    modules = lora_modules(transformer)
+    transformer._nunchaku_lite_lora_module_cache = modules
+
     base_state = {}
-    for name, module in lora_modules(transformer).items():
+    base_logical = {}  # fix #4: cache unpacked SVDQ logical forms
+    for name, module in modules.items():
         if isinstance(module, SVDQW4A4Linear):
-            base_state[f"{name}.proj_down"] = module.proj_down.detach().clone()
-            base_state[f"{name}.proj_up"] = module.proj_up.detach().clone()
+            base_down = module.proj_down.detach().clone()
+            base_up = module.proj_up.detach().clone()
+            base_state[f"{name}.proj_down"] = base_down
+            base_state[f"{name}.proj_up"] = base_up
+            # Pre-unpack to logical form so recompose doesn't repeat this work.
+            base_logical[f"{name}.down"] = svdq_down_to_logical(base_down, module, name)
+            base_logical[f"{name}.up"] = svdq_up_to_logical(base_up, module, name)
         elif isinstance(module, AWQW4A16Linear):
             device = module.qweight.device
             dtype = module.wscales.dtype
@@ -730,6 +824,7 @@ def ensure_lora_base_state(transformer: nn.Module) -> None:
                 dtype=module.weight.dtype,
             )
     transformer._nunchaku_lite_lora_base_state = base_state
+    transformer._nunchaku_lite_lora_base_logical = base_logical
 
 
 def resolve_lora_name(
@@ -755,8 +850,123 @@ def resolve_lora_name(
     return name
 
 
+def _invalidate_adapter_cache(transformer: nn.Module) -> None:
+    """Clear the per-adapter logical tensor cache.
+
+    Called when the set of loaded adapters changes (load/delete/reset) so
+    that the next recompose rebuilds the cache from the current state_dict.
+
+    Args:
+        transformer: Patched transformer with runtime adapter state.
+    """
+
+    transformer._nunchaku_lite_lora_adapter_cache = None
+
+
+def _ensure_adapter_cache(transformer: nn.Module) -> dict:
+    """Build (or return cached) per-adapter logical GPU tensors.
+
+    For each active adapter, pre-unpacks every SVDQ proj_down/proj_up to
+    logical form and moves them to the module's device.  The cache is keyed
+    by adapter name and invalidated whenever the adapter set changes.
+
+    For AWQ/dense adapters the raw state_dict tensors are stored as-is
+    (they are cheap to fit_lora_tensor at recompose time).
+
+    Args:
+        transformer: Patched transformer with runtime adapter state.
+
+    Returns:
+        Dict mapping adapter_name → {module_name → {"down": tensor, "up": tensor}}.
+    """
+
+    cache = transformer._nunchaku_lite_lora_adapter_cache
+    if cache is not None:
+        return cache
+
+    modules = transformer._nunchaku_lite_lora_module_cache
+    assert modules is not None, "module cache must be populated by ensure_lora_base_state"
+    active_names = active_lora_names(transformer)
+    cache = {}
+    for adapter_name in active_names:
+        entry = transformer._nunchaku_lite_loras[adapter_name]
+        state_dict = entry["state_dict"]
+        adapter_tensors: dict[str, dict[str, torch.Tensor]] = {}
+        for name, module in modules.items():
+            down_key = f"{name}.proj_down"
+            up_key = f"{name}.proj_up"
+            if down_key not in state_dict and up_key not in state_dict:
+                continue
+            if down_key not in state_dict or up_key not in state_dict:
+                raise ValueError(f"Incomplete LoRA tensors for {name}.")
+            if isinstance(module, SVDQW4A4Linear):
+                down_logical = svdq_down_to_logical(state_dict[down_key], module, name)
+                up_logical = svdq_up_to_logical(state_dict[up_key], module, name)
+                if down_logical.shape[0] != up_logical.shape[1]:
+                    raise ValueError(
+                        f"LoRA rank mismatch for {name}: "
+                        f"proj_down={tuple(down_logical.shape)}, proj_up={tuple(up_logical.shape)}"
+                    )
+                device = module.proj_down.device
+                dtype = module.proj_down.dtype
+                adapter_tensors[name] = {
+                    "down": down_logical.to(device=device, dtype=dtype),
+                    "up": up_logical.to(device=device, dtype=dtype),
+                }
+            else:
+                # AWQ / dense: keep raw tensors; fit at recompose time.
+                adapter_tensors[name] = {
+                    "down": state_dict[down_key],
+                    "up": state_dict[up_key],
+                }
+        cache[adapter_name] = adapter_tensors
+    transformer._nunchaku_lite_lora_adapter_cache = cache
+    return cache
+
+
+def _build_lora_scales(active_entries: list[dict], adapter_ranks: dict[str, int]) -> list[float]:
+    """Build the per-16-rank-block lora_scales list from adapter strengths.
+
+    The native kernel applies one scale per 16-rank-block.  Each adapter
+    occupies a contiguous range of rank blocks; its strength fills every
+    block it owns.
+
+    Args:
+        active_entries: Active adapter metadata entries in composition order.
+        adapter_ranks: Map from adapter name → per-module rank (int).
+
+    Returns:
+        Flat list of floats, one per 16-rank-block across the concatenated rank.
+    """
+
+    scales: list[float] = []
+    for entry in active_entries:
+        rank = adapter_ranks.get(entry.get("name", ""), 0)
+        if rank == 0:
+            continue
+        num_blocks = math.ceil(rank / 16)
+        scales.extend([float(entry["strength"])] * num_blocks)
+    return scales
+
+
 def recompose_loras(transformer: nn.Module) -> None:
     """Rebuild module LoRA tensors from base state plus all active adapters.
+
+    Optimisations vs. the original implementation:
+
+    - **Cached module scan** (fix #3): uses ``_nunchaku_lite_lora_module_cache``
+      instead of calling ``lora_modules()`` (3× named_modules) every time.
+    - **Cached base logical form** (fix #4): SVDQ base tensors are pre-unpacked
+      in ``ensure_lora_base_state`` and reused here.
+    - **Cached adapter logical form** (fix #5): active adapter tensors are
+      unpacked once and kept GPU-resident in ``_nunchaku_lite_lora_adapter_cache``.
+    - **lora_scales instead of strength baking** (fix #1): SVDQ adapter tensors
+      are concatenated *unscaled*; per-adapter strength is applied at kernel
+      time via ``_nunchaku_lite_lora_scales``.  This makes strength changes O(1).
+    - **Single cat for AWQ/dense** (fix #6): collects all down/up tensors in a
+      list and does one ``torch.cat`` instead of O(N²) incremental cats.
+    - **In-place parameter update** (fix #8): updates ``.data`` on existing
+      ``nn.Parameter`` objects instead of creating new ones.
 
     Args:
         transformer: Patched transformer whose quantized modules should receive
@@ -764,74 +974,130 @@ def recompose_loras(transformer: nn.Module) -> None:
     """
 
     ensure_lora_base_state(transformer)
-    modules = lora_modules(transformer)
+
+    # Deferred recompose support (fix #2): batch loading skips recompose.
+    if transformer._nunchaku_lite_defer_recompose:
+        return
+
+    modules = transformer._nunchaku_lite_lora_module_cache
     active_entries = active_lora_entries(transformer)
+
+    # Build adapter cache (fix #5) — also adds "name" to each entry for convenience.
+    for i, entry in enumerate(active_entries):
+        active_entries[i] = {**entry, "name": active_lora_names(transformer)[i]}
+    adapter_cache = _ensure_adapter_cache(transformer)
 
     for name, module in modules.items():
         if isinstance(module, SVDQW4A4Linear):
+            base_logical = transformer._nunchaku_lite_lora_base_logical
+            base_down_logical = base_logical[f"{name}.down"]
+            base_up_logical = base_logical[f"{name}.up"]
+
+            if not active_entries:
+                # No active adapters — restore the original base packed form
+                # directly from the cached snapshot (fix: avoids re-packing
+                # from logical form, which would pad rank to 16 and produce a
+                # different shape than the original base weight).
+                base_state = transformer._nunchaku_lite_lora_base_state
+                module.proj_down.data = base_state[f"{name}.proj_down"].clone().to(
+                    device=module.proj_down.device, dtype=module.proj_down.dtype
+                )
+                module.proj_up.data = base_state[f"{name}.proj_up"].clone().to(
+                    device=module.proj_up.device, dtype=module.proj_up.dtype
+                )
+                module.rank = base_state[f"{name}.proj_down"].shape[1]
+                # No lora scales needed (base has zero LoRA contribution).
+                if hasattr(module, "_nunchaku_lite_lora_scales"):
+                    delattr(module, "_nunchaku_lite_lora_scales")
+                continue
+
+            # Concatenate unscaled logical tensors (fix #1: strength via lora_scales).
+            logical_downs = [base_down_logical]
+            logical_ups = [base_up_logical]
+            adapter_ranks: dict[str, int] = {}
+            for entry in active_entries:
+                adapter_name = entry["name"]
+                adapter_tensors = adapter_cache.get(adapter_name, {})
+                if name not in adapter_tensors:
+                    continue
+                down_logical = adapter_tensors[name]["down"]
+                up_logical = adapter_tensors[name]["up"]
+                logical_downs.append(down_logical)
+                logical_ups.append(up_logical)
+                adapter_ranks[adapter_name] = down_logical.shape[0]  # rank is dim 0 for down
+
+            down_cat = torch.cat(logical_downs, dim=0)
+            up_cat = torch.cat(logical_ups, dim=1)
+
+            # Pack once (fix #10: only changed tensors would need repack, but
+            # cat always changes, so pack is unavoidable here).
+            down_packed = pack_lowrank_weight(down_cat, down=True)
+            up_packed = pack_lowrank_weight(up_cat, down=False)
+
+            # Update existing Parameter .data (fix #8: no new Parameter allocation).
+            module.proj_down.data = down_packed.to(device=module.proj_down.device, dtype=module.proj_down.dtype)
+            module.proj_up.data = up_packed.to(device=module.proj_up.device, dtype=module.proj_up.dtype)
+            module.rank = down_packed.shape[1]
+
+            # Build and attach lora_scales (fix #1): one scale per 16-rank-block.
+            # Base rank contributes scale=0 (no LoRA effect for base weights).
+            base_rank = base_down_logical.shape[0]
+            base_blocks = math.ceil(base_rank / 16)
+            adapter_scales = _build_lora_scales(active_entries, adapter_ranks)
+            # Base blocks get 0.0 (they represent the original model, not a LoRA).
+            # But actually base_down/up are the original model's LoRA params (rank r),
+            # which should always be active at scale 1.0. Let's set them to 1.0.
+            full_scales = [1.0] * base_blocks + adapter_scales
+            module._nunchaku_lite_lora_scales = full_scales
+        else:
+            # AWQ / dense path — fix #6: single cat instead of O(N²) incremental.
             base_down = transformer._nunchaku_lite_lora_base_state[f"{name}.proj_down"]
             base_up = transformer._nunchaku_lite_lora_base_state[f"{name}.proj_up"]
+
             if not active_entries:
-                down = base_down.to(device=module.proj_down.device, dtype=module.proj_down.dtype)
-                up = base_up.to(device=module.proj_up.device, dtype=module.proj_up.dtype)
-            else:
-                logical_downs = [svdq_down_to_logical(base_down, module, name)]
-                logical_ups = [svdq_up_to_logical(base_up, module, name)]
-                for entry in active_entries:
-                    state_dict = entry["state_dict"]
-                    down_key = f"{name}.proj_down"
-                    up_key = f"{name}.proj_up"
-                    if down_key not in state_dict and up_key not in state_dict:
-                        continue
-                    if down_key not in state_dict or up_key not in state_dict:
-                        raise ValueError(f"Incomplete LoRA tensors for {name}.")
-                    down_logical = svdq_down_to_logical(state_dict[down_key], module, name)
-                    up_logical = svdq_up_to_logical(state_dict[up_key], module, name)
-                    if down_logical.shape[0] != up_logical.shape[1]:
-                        raise ValueError(
-                            f"LoRA rank mismatch for {name}: "
-                            f"proj_down={tuple(down_logical.shape)}, proj_up={tuple(up_logical.shape)}"
-                        )
-                    down_logical = down_logical.to(device=logical_downs[0].device, dtype=logical_downs[0].dtype)
-                    up_logical = up_logical.to(device=logical_ups[0].device, dtype=logical_ups[0].dtype)
-                    logical_downs.append(down_logical * float(entry["strength"]))
-                    logical_ups.append(up_logical)
-                down = pack_lowrank_weight(torch.cat(logical_downs, dim=0), down=True)
-                up = pack_lowrank_weight(torch.cat(logical_ups, dim=1), down=False)
-                down = down.to(device=module.proj_down.device, dtype=module.proj_down.dtype)
-                up = up.to(device=module.proj_up.device, dtype=module.proj_up.dtype)
-            module.proj_down = nn.Parameter(down, requires_grad=module.proj_down.requires_grad)
-            module.proj_up = nn.Parameter(up, requires_grad=module.proj_up.requires_grad)
-            module.rank = down.shape[1]
-        else:
-            down = transformer._nunchaku_lite_lora_base_state[f"{name}.proj_down"]
-            up = transformer._nunchaku_lite_lora_base_state[f"{name}.proj_up"]
+                if isinstance(module, AWQW4A16Linear):
+                    device = module.qweight.device
+                    dtype = module.wscales.dtype
+                else:
+                    device = module.weight.device
+                    dtype = module.weight.dtype
+                module._nunchaku_lite_lora_down = base_down.to(device=device, dtype=dtype)
+                module._nunchaku_lite_lora_up = base_up.to(device=device, dtype=dtype)
+                continue
+
+            down_parts = [base_down]
+            up_parts = [base_up]
             for entry in active_entries:
-                state_dict = entry["state_dict"]
-                down_key = f"{name}.proj_down"
-                up_key = f"{name}.proj_up"
-                if down_key not in state_dict and up_key not in state_dict:
+                adapter_name = entry["name"]
+                adapter_tensors = adapter_cache.get(adapter_name, {})
+                if name not in adapter_tensors:
                     continue
-                if down_key not in state_dict or up_key not in state_dict:
-                    raise ValueError(f"Incomplete LoRA tensors for {name}.")
-                lora_down = fit_lora_tensor(state_dict[down_key], module.in_features, down=True, module_name=name)
-                lora_up = fit_lora_tensor(state_dict[up_key], module.out_features, down=False, module_name=name)
+                lora_down = fit_lora_tensor(
+                    adapter_tensors[name]["down"], module.in_features, down=True, module_name=name
+                )
+                lora_up = fit_lora_tensor(
+                    adapter_tensors[name]["up"], module.out_features, down=False, module_name=name
+                )
                 if lora_down.shape[1] != lora_up.shape[1]:
                     raise ValueError(
                         f"LoRA rank mismatch for {name}: "
                         f"proj_down={tuple(lora_down.shape)}, proj_up={tuple(lora_up.shape)}"
                     )
-                lora_down = lora_down.to(device=down.device, dtype=down.dtype) * float(entry["strength"])
-                lora_up = lora_up.to(device=up.device, dtype=up.dtype)
-                down = torch.cat([down, lora_down], dim=1)
-                up = torch.cat([up, lora_up], dim=1)
+                # Strength is baked for AWQ/dense (no kernel lora_scales support).
+                lora_down = lora_down.to(device=base_down.device, dtype=base_down.dtype) * float(entry["strength"])
+                lora_up = lora_up.to(device=base_up.device, dtype=base_up.dtype)
+                down_parts.append(lora_down)
+                up_parts.append(lora_up)
+
+            # Single cat (fix #6).
+            down = torch.cat(down_parts, dim=1)
+            up = torch.cat(up_parts, dim=1)
+
             if isinstance(module, AWQW4A16Linear):
                 device = module.qweight.device
                 dtype = module.wscales.dtype
             else:
                 device = module.weight.device
                 dtype = module.weight.dtype
-            down = down.to(device=device, dtype=dtype)
-            up = up.to(device=device, dtype=dtype)
-            module._nunchaku_lite_lora_down = down
-            module._nunchaku_lite_lora_up = up
+            module._nunchaku_lite_lora_down = down.to(device=device, dtype=dtype)
+            module._nunchaku_lite_lora_up = up.to(device=device, dtype=dtype)

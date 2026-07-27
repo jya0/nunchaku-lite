@@ -214,6 +214,7 @@ class SVDQW4A4Linear(nn.Module):
             output = torch.empty(
                 quantized_x.shape[0], self.out_features, dtype=self.proj_up.dtype, device=quantized_x.device
             )
+        lora_scales = getattr(self, "_nunchaku_lite_lora_scales", None)
         svdq_gemm_w4a4_cuda(
             act=quantized_x,
             wgt=self.qweight,
@@ -227,6 +228,7 @@ class SVDQW4A4Linear(nn.Module):
             alpha=self.wtscale,
             wcscales=self.wcscales,
             act_unsigned=self.act_unsigned,
+            lora_scales=lora_scales,
         )
         return output
 

@@ -274,7 +274,11 @@ def test_flux2_lora_strength_reset_delete_and_unload(tmp_path):
     logical_down = unpack_lowrank_weight(module.proj_down.detach(), down=True)
     assert transformer.get_list_adapters() == ["first", "second"]
     assert transformer.get_active_adapters() == ["second"]
-    assert torch.allclose(logical_down[4:5], torch.full_like(logical_down[4:5], 1.5))
+    # With lora_scales, packed weight is unscaled; strength is in lora_scales.
+    assert torch.allclose(logical_down[4:5], torch.full_like(logical_down[4:5], 3.0))
+    scales = getattr(module, "_nunchaku_lite_lora_scales", None)
+    assert scales is not None
+    assert scales[1] == 0.5  # second adapter strength
 
     transformer.disable_lora()
     assert transformer.get_active_adapters() == []
@@ -317,7 +321,11 @@ def test_flux2_pipeline_lora_mixin_maps_diffusers_api_to_transformer_runtime(tmp
     assert pipeline.get_active_adapters() == ["style"]
     pipeline.set_adapters("style", adapter_weights=0.5)
     logical_down = unpack_lowrank_weight(module.proj_down.detach(), down=True)
-    assert torch.allclose(logical_down[4:5], torch.full_like(logical_down[4:5], 0.5))
+    # With lora_scales, packed weight is unscaled; strength is in lora_scales.
+    assert torch.allclose(logical_down[4:5], torch.full_like(logical_down[4:5], 1.0))
+    scales = getattr(module, "_nunchaku_lite_lora_scales", None)
+    assert scales is not None
+    assert scales[1] == 0.5  # adapter strength
     pipeline.unload_lora_weights()
     assert pipeline.get_list_adapters() == {"transformer": []}
     assert torch.equal(module.proj_down, base_down)
