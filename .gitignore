@@ -21,6 +21,7 @@ test_results/
 
 .env
 .venv/
+.venv-supir/
 venv/
 
 # LoRA checkpoints and example script (not tracked)
