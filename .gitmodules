@@ -1,0 +1,4 @@
+[submodule "thirdparty/SUPIR"]
+	path = thirdparty/SUPIR
+	url = https://github.com/jya0/SUPIR.git
+	branch = jya0-supir
