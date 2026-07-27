@@ -52,8 +52,8 @@ precision = "int4"
 output_dir = Path("outputs")
 
 # Fixed generation settings (per request)
-HEIGHT = 1280
-WIDTH = 1280
+HEIGHT = 1024
+WIDTH = 1024
 NUM_INFERENCE_STEPS = 8
 GUIDANCE_SCALE = 0.0
 
