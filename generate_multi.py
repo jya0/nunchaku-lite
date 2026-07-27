@@ -52,10 +52,10 @@ precision = "int4"
 output_dir = Path("outputs")
 
 # Fixed generation settings (per request)
-HEIGHT = 1024
-WIDTH = 1024
+HEIGHT = 1280
+WIDTH = 1280
 NUM_INFERENCE_STEPS = 8
-GUIDANCE_SCALE = 1.0
+GUIDANCE_SCALE = 0.0
 
 # Number of images generated per prompt in a single batched forward pass.
 IMAGES_PER_PROMPT = 2
