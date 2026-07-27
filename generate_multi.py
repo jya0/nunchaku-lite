@@ -146,36 +146,36 @@ def gpu_worker(
 
                 prompt_idx, prompt, base_seed, img_start = item
 
-                # Build generators for this prompt
+                # Generate one image at a time (no batching) to reduce peak VRAM.
                 seeds: list[int] = []
-                generators: list[torch.Generator] = []
                 cur_seed = base_seed
-                for _ in range(IMAGES_PER_PROMPT):
+                t0 = time.perf_counter()
+                for img_offset in range(IMAGES_PER_PROMPT):
                     s = cur_seed if cur_seed is not None else torch.seed() % (2**32)
                     cur_seed = None if cur_seed is None else (cur_seed + 1) % (2**32)
-                    generators.append(torch.Generator(device=device).manual_seed(s))
                     seeds.append(s)
+                    generator = torch.Generator(device=device).manual_seed(s)
 
-                t0 = time.perf_counter()
-                images = pipe(
-                    prompt=prompt,
-                    height=HEIGHT,
-                    width=WIDTH,
-                    num_inference_steps=NUM_INFERENCE_STEPS,
-                    guidance_scale=GUIDANCE_SCALE,
-                    num_images_per_prompt=IMAGES_PER_PROMPT,
-                    generator=generators,
-                ).images
-                dt = time.perf_counter() - t0
+                    image = pipe(
+                        prompt=prompt,
+                        height=HEIGHT,
+                        width=WIDTH,
+                        num_inference_steps=NUM_INFERENCE_STEPS,
+                        guidance_scale=GUIDANCE_SCALE,
+                        num_images_per_prompt=1,
+                        generator=generator,
+                    ).images[0]
 
-                for img_num, (image, seed) in enumerate(zip(images, seeds), start=img_start):
-                    fname = f"{prompt_idx:03d}_{img_num}_seed{seed}.png"
+                    img_num = img_start + img_offset
+                    fname = f"{prompt_idx:03d}_{img_num}_seed{s}.png"
                     output_path = run_dir_path / fname
                     image.save(output_path)
+                    del image
+                    torch.cuda.empty_cache()
+
+                dt = time.perf_counter() - t0
 
                 result_queue.put(("done", (gpu_id, prompt_idx, dt, seeds)))
-                del images
-                torch.cuda.empty_cache()
 
         result_queue.put((_WORKER_DONE, gpu_id))
     except Exception as exc:  # noqa: BLE001
