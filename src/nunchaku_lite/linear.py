@@ -13,7 +13,7 @@ class DenseRuntimeLoraLinear(nn.Linear):
     """Dense linear layer with runtime LoRA branches managed by Nunchaku Lite."""
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "DenseRuntimeLoraLinear":
+    def from_linear(cls, linear: nn.Linear, **kwargs) -> "DenseRuntimeLoraLinear":
         """Wrap an existing dense linear while preserving its state-dict keys.
 
         Args:
@@ -128,9 +128,6 @@ class SVDQW4A4Linear(nn.Module):
             requires_grad=False,
         )
         self.smooth_factor = nn.Parameter(
-            torch.empty(in_features, dtype=torch_dtype, device=device), requires_grad=False
-        )
-        self.smooth_factor_orig = nn.Parameter(
             torch.empty(in_features, dtype=torch_dtype, device=device), requires_grad=False
         )
         self.proj_down = nn.Parameter(torch.empty(in_features, rank, dtype=torch_dtype, device=device))
