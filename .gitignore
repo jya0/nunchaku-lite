@@ -24,6 +24,9 @@ test_results/
 .venv-supir/
 venv/
 
+# Third-party cloned repos (do not commit)
+thirdparty/
+
 # LoRA checkpoints and example script (not tracked)
 *.safetensors
 example.py

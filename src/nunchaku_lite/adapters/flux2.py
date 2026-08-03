@@ -510,6 +510,32 @@ def lite_flux2_forward(
     return Transformer2DModelOutput(sample=output)
 
 
+def _restore_kv_attn_processors(transformer: torch.nn.Module) -> None:
+    """Re-install Nunchaku attention processors after a KV pipeline override.
+
+    ``Flux2KleinKVPipeline.__init__`` calls ``_set_kv_attn_processors()`` which
+    replaces every block's processor with a stock Diffusers KV variant.  Those
+    variants reference unfused ``to_q`` / ``to_k`` / ``to_v`` attributes that
+    the Nunchaku adapter has fused into ``to_qkv``, so we must restore the
+    Nunchaku processors that already understand KV-cache extract/cached modes.
+
+    Args:
+        transformer: Patched Flux2 transformer whose processors were overwritten.
+
+    Returns:
+        None.
+    """
+
+    for block in transformer.transformer_blocks:
+        attn = getattr(block, "attn", None)
+        if isinstance(attn, NunchakuFlux2Attention):
+            attn.set_processor(NunchakuFlux2AttnProcessor(getattr(attn, "processor", None)))
+    for block in transformer.single_transformer_blocks:
+        attn = getattr(block, "attn", None)
+        if isinstance(attn, NunchakuFlux2ParallelSelfAttention):
+            attn.set_processor(NunchakuFlux2ParallelSelfAttnProcessor(getattr(attn, "processor", None)))
+
+
 class Flux2Adapter:
     """Adapter for Diffusers ``Flux2Transformer2DModel`` checkpoints."""
 
@@ -573,11 +599,25 @@ class Flux2Adapter:
         component_name: str = "transformer",
         component: torch.nn.Module | None = None,
     ) -> None:
-        """Attach Flux2 pipeline-level runtime APIs."""
+        """Attach Flux2 pipeline-level runtime APIs.
+
+        When the pipeline is a ``Flux2KleinKVPipeline``, its ``__init__`` calls
+        ``_set_kv_attn_processors()`` which replaces the Nunchaku attention
+        processors with stock Diffusers KV processors.  Those processors expect
+        unfused ``to_q`` / ``to_k`` / ``to_v`` projections that no longer exist
+        after patching.  We re-install the Nunchaku processors (which already
+        support KV-cache extract/cached modes) to restore correctness.
+        """
 
         from ..lora.core.runtime import NunchakuPipelineLoraMixin, bind_pipeline_lora_methods
 
         bind_pipeline_lora_methods(pipeline, NunchakuPipelineLoraMixin)
+
+        if (
+            pipeline.__class__.__name__ == "Flux2KleinKVPipeline"
+            and component is not None
+        ):
+            _restore_kv_attn_processors(component)
 
     def _patch_transformer(self, transformer: torch.nn.Module, context: SVDQPatchContext) -> None:
         """Patch Flux2 block modules through one recursive transformer traversal.
