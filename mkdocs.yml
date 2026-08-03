@@ -83,6 +83,7 @@ nav:
           - Qwen-Image: models/qwen_image.md
           - SDXL: models/sdxl.md
           - Z-Image Turbo: models/z_image.md
+      - Best Model for Each Task: best_model_for_each.md
       - API Reference: api.md
       - Roadmap: roadmap.md
       - Documentation Deployment: deployment.md
