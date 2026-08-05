@@ -105,13 +105,16 @@ def normalize_qwen_image_diffusers_lora_state_dict(state_dict: dict[str, torch.T
 
     Args:
         state_dict: Raw Qwen-Image LoRA tensors. Diffusers ``lora_down`` and
-            ``lora_up`` names are rewritten to PEFT A/B names, and network
-            alpha values are applied to the matching down tensors.
+            ``lora_up`` names are rewritten to PEFT A/B names, ComfyUI
+            ``diffusion_model.`` prefixes are stripped, and network alpha values
+            are applied to the matching down tensors.
     """
 
     tensors = {}
     for key, value in state_dict.items():
         new_key = strip_transformer_prefix(key)
+        if new_key.startswith("diffusion_model."):
+            new_key = new_key[len("diffusion_model.") :]
         new_key = new_key.replace(".lora_down.weight", LORA_A_SUFFIX)
         new_key = new_key.replace(".lora_up.weight", LORA_B_SUFFIX)
         tensors[new_key] = normalize_float_tensor(value)
